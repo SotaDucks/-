@@ -71,6 +71,19 @@ body {
 .redrop:hover { border-color: var(--ink); }
 .redrop:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .redrop kbd { font-family: var(--font-mono); font-size: 10.5px; color: var(--muted); margin-left: 4px; }
+/* multiplayer status chip under the brand */
+.net {
+  position: fixed; left: max(16px, env(safe-area-inset-left, 0px)); top: max(50px, calc(env(safe-area-inset-top, 0px) + 46px));
+  display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted);
+  background: var(--panel); border: 1px solid var(--panel-line); border-radius: 999px; padding: 3px 4px 3px 10px;
+  backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+}
+.net[hidden] { display: none; }
+.net .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
+.net.on .dot { background: var(--debug); }
+.net b { font-family: var(--font-mono); font-weight: 500; color: var(--ink); }
+.net button { font: inherit; font-size: 12px; color: var(--ink); background: var(--chip); cursor: pointer; border: 0; border-radius: 999px; padding: 2px 10px; }
+.net button:hover { background: var(--panel-line); }
 /* bottom HUD: stamina always, charge only while the fish is curled */
 .hud {
   position: fixed; left: 50%; transform: translateX(-50%); pointer-events: none;
@@ -114,6 +127,7 @@ body {
 
 <h1 class="brand">剑鱼</h1>
 <button class="redrop" id="btnDrop" title="把鱼重新从天上扔下来">重新投放<kbd>R</kbd></button>
+<div class="net" id="net" hidden aria-live="polite"><i class="dot"></i><span>房间 <b id="netRoom"></b> · <span id="netCount">连接中…</span></span><button id="btnInvite" title="复制本房间链接，发给朋友一起玩">邀请</button></div>
 <section class="tune" id="tune" hidden aria-label="手感参数"></section>
 <div class="hud">
   <div class="bar charge" id="chargeBar" aria-hidden="true"><i id="power"></i></div>
@@ -895,15 +909,23 @@ function buildFins() {
   }
   return gb.build();
 }
-const bones = SEGS.map((g, i) => { const b = new THREE.Bone(); b.position.set(X0 - CENTERS[i], 0, 0); return b; });
-const rig = new THREE.Object3D(); bones.forEach((b) => rig.add(b)); scene.add(rig);
-rig.updateMatrixWorld(true);
-const skeleton = new THREE.Skeleton(bones);
+const bodyGeo = buildBody(), finGeo = buildFins();
 const bodyMat = new THREE.MeshStandardMaterial({ vertexColors: true, flatShading: true, roughness: 0.36, metalness: 0.28, transparent: false });
 const finMat = new THREE.MeshStandardMaterial({ vertexColors: true, flatShading: true, roughness: 0.5, metalness: 0.15, side: THREE.DoubleSide });
-const bodyMesh = new THREE.SkinnedMesh(buildBody(), bodyMat);
-const finMesh = new THREE.SkinnedMesh(buildFins(), finMat);
-for (const m of [bodyMesh, finMesh]) { m.bind(skeleton); m.castShadow = true; m.frustumCulled = false; scene.add(m); }
+// One skinned fish (bones + body + fins) sharing the geometry; remote players get their own rig and tinted materials.
+function makeRig(bMat, fMat) {
+  const bones = SEGS.map((g, i) => { const b = new THREE.Bone(); b.position.set(X0 - CENTERS[i], 0, 0); return b; });
+  const rig = new THREE.Object3D(); bones.forEach((b) => rig.add(b)); scene.add(rig);
+  rig.updateMatrixWorld(true);
+  const skeleton = new THREE.Skeleton(bones);
+  const meshes = [new THREE.SkinnedMesh(bodyGeo, bMat), new THREE.SkinnedMesh(finGeo, fMat)];
+  for (const m of meshes) { m.bind(skeleton); m.castShadow = true; m.frustumCulled = false; scene.add(m); }
+  return {
+    bones, rig, meshes,
+    dispose() { scene.remove(rig, ...meshes); skeleton.dispose(); },
+  };
+}
+const { bones, rig } = makeRig(bodyMat, finMat);
 
 const aimMat = new THREE.LineDashedMaterial({ dashSize: 0.08, gapSize: 0.06, transparent: true, depthTest: false });
 const aimRingMat = new THREE.MeshBasicMaterial({ transparent: true, side: THREE.DoubleSide, depthTest: false });
@@ -932,8 +954,10 @@ new MutationObserver(applyTheme).observe(document.documentElement, { attributes:
 const $ = (id) => document.getElementById(id);
 const ui = { power: $('power'), chargeBar: $('chargeBar'), energy: $('energy'), energyBar: $('energyBar'), hint: $('hint') };
 const SPAWN = [0, 0, 0], DROP_H = 3.6;
+let dropCount = 0; // sent to peers so they snap (not glide) to a re-dropped fish
 function dropFish() {
   fish.drop(SPAWN, Math.random() * Math.PI * 2, DROP_H);
+  dropCount++;
   snapJiggle();
   follow.snap(SPAWN);
   const d = new THREE.Vector3().fromArray(follow.target).sub(controls.target);
@@ -1310,6 +1334,105 @@ function placeSun(t) {
   sun.target.position.copy(sunFocus); sun.position.copy(sunFocus).add(SUN_OFFSET);
 }
 
+// ---------------- multiplayer (Trystero: peer-to-peer WebRTC, matchmaking over public MQTT brokers) ----------------
+// Each player simulates only their own fish and broadcasts its segment poses; other players' fish are
+// drawn from those snapshots, interpolated slightly in the past. No shared physics, no game server.
+const NET_HZ = 20, NET_DELAY = 120;  // send rate; remote fish are drawn this many ms behind to hide jitter
+const POSE_LEN = 2 + N * 7;          // [sendTime, dropCount, then x,y,z, qx,qy,qz,qw per segment]
+// STUN servers reachable from mainland China first, then the usual global ones
+const ICE = ['stun:stun.miwifi.com:3478', 'stun:stun.chat.bilibili.com:3478', 'stun:stun.cloudflare.com:3478', 'stun:stun.l.google.com:19302'].map((urls) => ({ urls }));
+const roomId = (() => {
+  const u = new URL(location.href);
+  let r = (u.searchParams.get('room') || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 24);
+  if (!r) { r = Math.random().toString(36).slice(2, 7); u.searchParams.set('room', r); history.replaceState(null, '', u); }
+  return r;
+})();
+const remotes = new Map(); // peerId -> { rig, bones, meshes, mats, snaps, off, dropN }
+function tintFor(id) { let h = 0; for (const c of id) h = (h * 31 + c.charCodeAt(0)) >>> 0; return new THREE.Color().setHSL((h % 360) / 360, 0.55, 0.78); }
+function addRemote(id) {
+  let r = remotes.get(id);
+  if (r) return r;
+  const bm = bodyMat.clone(), fm = finMat.clone();
+  bm.color.copy(tintFor(id)); fm.color.copy(bm.color);
+  r = Object.assign(makeRig(bm, fm), { mats: [bm, fm], snaps: [], off: null, dropN: -1 });
+  for (const m of r.meshes) m.visible = false; // until the first pose arrives
+  remotes.set(id, r);
+  return r;
+}
+function removeRemote(id) {
+  const r = remotes.get(id); if (!r) return;
+  r.dispose(); for (const m of r.mats) m.dispose();
+  remotes.delete(id);
+}
+function packPose() {
+  const a = new Float64Array(POSE_LEN);
+  a[0] = performance.now(); a[1] = dropCount;
+  fish.bodies.forEach((b, i) => { a.set(b.x, 2 + i * 7); a.set(b.q, 5 + i * 7); });
+  return a;
+}
+function onPose(data, peerId) {
+  const a = data instanceof ArrayBuffer ? new Float64Array(data)
+    : ArrayBuffer.isView(data) ? new Float64Array(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)) : null;
+  if (!a || a.length !== POSE_LEN || !a.every(Number.isFinite)) return;
+  const r = addRemote(peerId), s = r.snaps;
+  if (a[1] !== r.dropN) { s.length = 0; r.dropN = a[1]; } // re-dropped: snap instead of gliding across the map
+  if (s.length && a[0] <= s[s.length - 1].t) return;
+  // clock offset = fastest observed transit; creeps up slowly so clock drift can't stall playback
+  const o = performance.now() - a[0];
+  r.off = r.off === null ? o : Math.min(o, r.off + 0.05);
+  s.push({ t: a[0], a });
+  if (s.length > 40) s.shift();
+}
+const qa = new THREE.Quaternion(), qb = new THREE.Quaternion();
+function updateRemotes() {
+  const now = performance.now();
+  for (const r of remotes.values()) {
+    const s = r.snaps; if (!s.length) continue;
+    const t = now - r.off - NET_DELAY;
+    while (s.length > 2 && s[1].t <= t) s.shift();
+    const A = s[0], B = s[1] || A;
+    const k = B.t > A.t ? THREE.MathUtils.clamp((t - A.t) / (B.t - A.t), 0, 1) : 1;
+    r.bones.forEach((bone, i) => {
+      const o = 2 + i * 7;
+      bone.position.set(A.a[o] + (B.a[o] - A.a[o]) * k, A.a[o + 1] + (B.a[o + 1] - A.a[o + 1]) * k, A.a[o + 2] + (B.a[o + 2] - A.a[o + 2]) * k);
+      bone.quaternion.slerpQuaternions(qa.fromArray(A.a, o + 3), qb.fromArray(B.a, o + 3), k);
+    });
+    for (const m of r.meshes) m.visible = true;
+    r.rig.updateMatrixWorld(true);
+  }
+}
+function updateNetUI() {
+  const n = remotes.size;
+  $('net').classList.toggle('on', n > 0);
+  $('netCount').textContent = n ? `${n + 1} 人在线` : '等待朋友加入';
+}
+async function startNet() {
+  $('net').hidden = false; $('netRoom').textContent = roomId;
+  $('btnInvite').onclick = async (e) => {
+    const b = e.currentTarget;
+    try { await navigator.clipboard.writeText(location.href); b.textContent = '已复制链接'; }
+    catch (_) { window.prompt('复制这个链接发给朋友：', location.href); }
+    setTimeout(() => { b.textContent = '邀请'; }, 1500);
+  };
+  let room;
+  try {
+    const { joinRoom } = await import('https://cdn.jsdelivr.net/npm/@trystero-p2p/mqtt@0.26.0/+esm');
+    room = joinRoom({ appId: 'xianyu-fanshen-swordfish', rtcConfig: { iceServers: ICE } }, roomId, {
+      onJoinError: (d) => console.warn('[net] join error', d),
+    });
+  } catch (err) {
+    console.warn('[net] multiplayer unavailable', err);
+    $('netCount').textContent = '联机不可用';
+    return;
+  }
+  const pose = room.makeAction('pose', { onMessage: (data, ctx) => onPose(data, ctx.peerId) });
+  room.onPeerJoin = (id) => { addRemote(id); updateNetUI(); };
+  room.onPeerLeave = (id) => { removeRemote(id); updateNetUI(); };
+  updateNetUI();
+  setInterval(() => { if (remotes.size) Promise.resolve(pose.send(packPose())).catch(() => {}); }, 1000 / NET_HZ);
+  window.addEventListener('pagehide', () => room.leave());
+}
+
 // ---------------- loop ----------------
 function resize() {
   const w = window.innerWidth, h = window.innerHeight;
@@ -1348,6 +1471,7 @@ function frame() {
   // skin
   applySkin(dt);
   rig.updateMatrixWorld(true);
+  updateRemotes();
 
   // camera follows a filtered focus point (see makeFollow) without taking the orbit away from the viewer
   const ft = follow.update(dt);
@@ -1361,6 +1485,7 @@ function frame() {
 }
 dropFish();
 requestAnimationFrame(frame);
+startNet();
 </script>
 
 </body></html>
