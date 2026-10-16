@@ -1334,13 +1334,13 @@ function placeSun(t) {
   sun.target.position.copy(sunFocus); sun.position.copy(sunFocus).add(SUN_OFFSET);
 }
 
-// ---------------- multiplayer (Trystero: peer-to-peer WebRTC, matchmaking over public MQTT brokers) ----------------
-// Each player simulates only their own fish and broadcasts its segment poses; other players' fish are
-// drawn from those snapshots, interpolated slightly in the past. No shared physics, no game server.
+// ---------------- multiplayer (WebSocket relay on Cloudflare, see server/) ----------------
+// Each player simulates only their own fish and sends its segment poses to the room relay, which forwards
+// them to everyone else; other players' fish are drawn from those snapshots, interpolated slightly in the past.
+// The relay runs no physics, so the game's mechanics are unchanged.
 const NET_HZ = 20, NET_DELAY = 120;  // send rate; remote fish are drawn this many ms behind to hide jitter
 const POSE_LEN = 2 + N * 7;          // [sendTime, dropCount, then x,y,z, qx,qy,qz,qw per segment]
-// STUN servers reachable from mainland China first, then the usual global ones
-const ICE = ['stun:stun.miwifi.com:3478', 'stun:stun.chat.bilibili.com:3478', 'stun:stun.cloudflare.com:3478', 'stun:stun.l.google.com:19302'].map((urls) => ({ urls }));
+const RELAY = new URLSearchParams(location.search).get('relay') || 'wss://xianyu-relay.xianyu-relay.workers.dev';
 const roomId = (() => {
   const u = new URL(location.href);
   let r = (u.searchParams.get('room') || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 24);
@@ -1401,12 +1401,31 @@ function updateRemotes() {
     r.rig.updateMatrixWorld(true);
   }
 }
+let ws = null, retry = 0;
 function updateNetUI() {
-  const n = remotes.size;
-  $('net').classList.toggle('on', n > 0);
-  $('netCount').textContent = n ? `${n + 1} 人在线` : '等待朋友加入';
+  const n = remotes.size, up = ws && ws.readyState === WebSocket.OPEN;
+  $('net').classList.toggle('on', up && n > 0);
+  $('netCount').textContent = !up ? (retry ? '连接断开，重连中…' : '连接中…') : n ? `${n + 1} 人在线` : '等待朋友加入';
 }
-async function startNet() {
+function connect() {
+  ws = new WebSocket(`${RELAY}/room/${roomId}`);
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => { retry = 0; updateNetUI(); };
+  ws.onmessage = (e) => {
+    if (typeof e.data !== 'string') { const a = new Float64Array(e.data); onPose(a.subarray(1), 'p' + a[0]); return; }
+    let m; try { m = JSON.parse(e.data); } catch (_) { return; }
+    if (m.t === 'hello') for (const id of m.peers) addRemote('p' + id);
+    else if (m.t === 'join') addRemote('p' + m.id);
+    else if (m.t === 'leave') removeRemote('p' + m.id);
+    updateNetUI();
+  };
+  ws.onclose = () => {
+    for (const id of [...remotes.keys()]) removeRemote(id);
+    retry++; updateNetUI();
+    setTimeout(connect, Math.min(10000, 1000 * 2 ** Math.min(retry, 4)));
+  };
+}
+function startNet() {
   $('net').hidden = false; $('netRoom').textContent = roomId;
   $('btnInvite').onclick = async (e) => {
     const b = e.currentTarget;
@@ -1414,23 +1433,8 @@ async function startNet() {
     catch (_) { window.prompt('复制这个链接发给朋友：', location.href); }
     setTimeout(() => { b.textContent = '邀请'; }, 1500);
   };
-  let room;
-  try {
-    const { joinRoom } = await import('https://cdn.jsdelivr.net/npm/@trystero-p2p/mqtt@0.26.0/+esm');
-    room = joinRoom({ appId: 'xianyu-fanshen-swordfish', rtcConfig: { iceServers: ICE } }, roomId, {
-      onJoinError: (d) => console.warn('[net] join error', d),
-    });
-  } catch (err) {
-    console.warn('[net] multiplayer unavailable', err);
-    $('netCount').textContent = '联机不可用';
-    return;
-  }
-  const pose = room.makeAction('pose', { onMessage: (data, ctx) => onPose(data, ctx.peerId) });
-  room.onPeerJoin = (id) => { addRemote(id); updateNetUI(); };
-  room.onPeerLeave = (id) => { removeRemote(id); updateNetUI(); };
-  updateNetUI();
-  setInterval(() => { if (remotes.size) Promise.resolve(pose.send(packPose())).catch(() => {}); }, 1000 / NET_HZ);
-  window.addEventListener('pagehide', () => room.leave());
+  connect();
+  setInterval(() => { if (remotes.size && ws.readyState === WebSocket.OPEN) ws.send(packPose()); }, 1000 / NET_HZ);
 }
 
 // ---------------- loop ----------------
