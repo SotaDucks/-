@@ -84,17 +84,32 @@ body {
 .net b { font-family: var(--font-mono); font-weight: 500; color: var(--ink); }
 .net button { font: inherit; font-size: 12px; color: var(--ink); background: var(--chip); cursor: pointer; border: 0; border-radius: 999px; padding: 2px 10px; }
 .net button:hover { background: var(--panel-line); }
-/* bottom HUD: stamina always, charge only while the fish is curled */
+/* BOTW-style stamina wheel: screen-space UI anchored beside the local fish. */
+.stamina {
+  position: fixed; left: 0; top: 0; width: 44px; height: 44px; pointer-events: none;
+  color: #45ef76; opacity: 0; transition: opacity 0.22s;
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.32)); will-change: transform;
+}
+.stamina.visible { opacity: 1; }
+.stamina[hidden] { display: none; }
+.stamina svg { display: block; width: 100%; height: 100%; }
+.stamina .well { fill: rgba(24, 29, 21, 0.62); }
+.stamina .track { fill: none; stroke: rgba(13, 20, 15, 0.55); stroke-width: 14; }
+.stamina .fill {
+  fill: none; stroke: currentColor; stroke-width: 14; stroke-linecap: butt;
+  transform: rotate(-90deg) scaleY(-1); transform-origin: 32px 32px;
+  transition: stroke-dashoffset 0.08s linear, stroke 0.16s;
+}
+.stamina .rim { fill: none; stroke: rgba(217, 246, 201, 0.5); stroke-width: 0.8; }
+.stamina.low { color: #ff6255; }
+.stamina.low svg { animation: stamina-warning 0.7s ease-in-out infinite alternate; }
+@keyframes stamina-warning { to { opacity: 0.55; } }
+/* Only the controls hint remains at the bottom of the screen. */
 .hud {
   position: fixed; left: 50%; transform: translateX(-50%); pointer-events: none;
   bottom: max(22px, calc(env(safe-area-inset-bottom, 0px) + 12px));
-  width: min(320px, calc(100% - 48px)); display: grid; gap: 7px; justify-items: center;
+  width: min(320px, calc(100% - 48px));
 }
-.bar { width: 100%; height: 6px; border-radius: 3px; background: var(--chip); overflow: hidden; }
-.bar i { display: block; height: 100%; width: 100%; border-radius: 3px; transform-origin: left; background: var(--fish); }
-.bar.charge { height: 8px; opacity: 0; transition: opacity 0.12s; }
-.bar.charge i { background: var(--accent); transform: scaleX(0); }
-.bar.charge.on { opacity: 1; }
 .hint { margin: 2px 0 0; font-size: 12px; color: var(--muted); text-align: center; transition: opacity 0.8s; }
 .hint.gone { opacity: 0; }
 .tune {
@@ -118,7 +133,10 @@ body {
 .tune button { font: inherit; font-size: 12px; color: var(--ink); background: transparent; cursor: pointer; border: 1px solid var(--panel-line); border-radius: 999px; padding: 3px 11px; }
 .tune button:hover { border-color: var(--ink); }
 .err { position: fixed; left: 16px; top: 56px; padding: 12px 14px; border-radius: 10px; background: var(--panel); border: 1px solid var(--accent); }
-@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; }
+  .stamina.low svg { animation: none; }
+}
 </style>
 </head>
 <body>
@@ -129,9 +147,16 @@ body {
 <button class="redrop" id="btnDrop" title="把鱼重新从天上扔下来">重新投放<kbd>R</kbd></button>
 <div class="net" id="net" hidden aria-live="polite"><i class="dot"></i><span>房间 <b id="netRoom"></b> · <span id="netCount">连接中…</span></span><button id="btnInvite" title="复制本房间链接，发给朋友一起玩">邀请</button></div>
 <section class="tune" id="tune" hidden aria-label="手感参数"></section>
+<div class="stamina" id="stamina" role="meter" aria-label="耐力" aria-valuemin="0" aria-valuemax="100" aria-valuenow="100" hidden>
+  <svg viewBox="0 0 64 64" aria-hidden="true">
+    <circle class="well" cx="32" cy="32" r="28" />
+    <circle class="track" cx="32" cy="32" r="20" />
+    <circle class="fill" id="staminaFill" cx="32" cy="32" r="20" pathLength="100" stroke-dasharray="100 100" stroke-dashoffset="0" />
+    <circle class="rim" cx="32" cy="32" r="27.5" />
+    <circle class="rim" cx="32" cy="32" r="12.5" />
+  </svg>
+</div>
 <div class="hud">
-  <div class="bar charge" id="chargeBar" aria-hidden="true"><i id="power"></i></div>
-  <div class="bar" role="meter" aria-label="体力" aria-valuemin="0" aria-valuemax="100" id="energyBar"><i id="energy"></i></div>
   <p class="hint" id="hint">按住左键蓄力，松开朝鼠标方向跳 · 右键拖动转视角 · 滚轮缩放 · T 调手感</p>
 </div>
 
@@ -424,7 +449,7 @@ new MutationObserver(applyTheme).observe(document.documentElement, { attributes:
 
 // ---------------- UI ----------------
 const $ = (id) => document.getElementById(id);
-const ui = { power: $('power'), chargeBar: $('chargeBar'), energy: $('energy'), energyBar: $('energyBar'), hint: $('hint') };
+const ui = { stamina: $('stamina'), staminaFill: $('staminaFill'), hint: $('hint') };
 const SPAWN = [0, 0, 0], DROP_H = 3.6;
 let dropCount = 0; // sent to peers so they snap (not glide) to a re-dropped fish
 function dropFish() {
@@ -948,15 +973,35 @@ function resize() {
 window.addEventListener('resize', resize); resize();
 
 const v3 = new THREE.Vector3();
-let uiT = 0, jumps = 0;
+const staminaAnchor = new THREE.Vector3(), staminaBone = new THREE.Vector3();
+let uiT = 0, jumps = 0, staminaLinger = 1;
 function updateUI(dt) {
-  const pw = fish.chargePower();
-  ui.chargeBar.classList.toggle('on', fish.charging());
-  ui.power.style.transform = `scaleX(${pw.toFixed(3)})`;
+  // Project after rendering so both camera modes (including pixel snapping) match the drawn fish.
+  staminaAnchor.fromArray(fish.com()).project(camera);
+  const onScreen = staminaAnchor.z >= -1 && staminaAnchor.z <= 1
+    && Math.abs(staminaAnchor.x) <= 1 && Math.abs(staminaAnchor.y) <= 1;
+  ui.stamina.hidden = !onScreen;
+  if (onScreen) {
+    let left = Infinity, right = -Infinity, top = Infinity;
+    for (const bone of bones) {
+      staminaBone.copy(bone.position).project(camera);
+      left = Math.min(left, staminaBone.x); right = Math.max(right, staminaBone.x);
+      top = Math.min(top, (1 - staminaBone.y) * window.innerHeight / 2);
+    }
+    // Keep a small, upright wheel above the left shoulder of the fish, independent of its heading.
+    const offset = THREE.MathUtils.clamp((right - left) * window.innerWidth * 0.16, 38, 64);
+    const x = THREE.MathUtils.clamp((staminaAnchor.x + 1) * window.innerWidth / 2 - offset, 28, window.innerWidth - 28);
+    const y = THREE.MathUtils.clamp(top - 34, 28, window.innerHeight - 28);
+    ui.stamina.style.transform = `translate3d(${x.toFixed(1)}px, ${y.toFixed(1)}px, 0) translate(-50%, -50%)`;
+  }
+  const energy = THREE.MathUtils.clamp(fish.energy, 0, 1);
+  if (energy < 0.999 || fish.charging() || fish.state === 'slap' || fish.state === 'air') staminaLinger = 0.7;
+  else staminaLinger = Math.max(0, staminaLinger - dt);
+  ui.stamina.classList.toggle('visible', staminaLinger > 0);
+  ui.stamina.classList.toggle('low', energy < 0.3);
   uiT += dt; if (uiT < 0.08) return; uiT = 0;
-  ui.energy.style.transform = `scaleX(${fish.energy.toFixed(3)})`;
-  ui.energy.style.background = fish.energy < 0.3 ? 'var(--accent)' : 'var(--fish)';
-  ui.energyBar.setAttribute('aria-valuenow', String(Math.round(fish.energy * 100)));
+  ui.staminaFill.style.strokeDashoffset = ((1 - energy) * 100).toFixed(3);
+  ui.stamina.setAttribute('aria-valuenow', String(Math.round(energy * 100)));
   if (jumps >= 2) ui.hint.classList.add('gone');
 }
 
@@ -996,8 +1041,8 @@ function frame() {
   controls.target.add(v3); camera.position.add(v3);
   placeSun(ft);
   controls.update();
-  updateUI(dt);
   renderFrame();
+  updateUI(dt);
   requestAnimationFrame(frame);
 }
 dropFish();
